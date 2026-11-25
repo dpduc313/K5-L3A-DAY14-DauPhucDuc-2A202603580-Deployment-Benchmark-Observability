@@ -400,9 +400,98 @@ history count = 8
 
 Một instance chết, 2 instance còn lại tiếp tục phục vụ, history không mất câu nào. (Trường `turn` lệch 1 so với số câu thật vì code đếm câu hỏi của user sau khi đã thêm câu hiện tại vào history rồi còn cộng thêm 1.) Xong thì `docker compose -p k5-day14-scaling down -v`.
 
-## Part 6: Output `check_production_ready.py`
+## Part 6: Final Project — output `check_production_ready.py`
 
-(CP5)
+Chạy bản đầy đủ (có Docker) trong `06-lab-complete/`, trên WSL2 Ubuntu (`os.name = posix`), Python 3.11.18:
+
+```text
+$ python check_production_ready.py
+...
+     ✅ Docker: image < 500 MB — 273 MB
+     ✅ Khi chạy: vượt giới hạn → 429 — 429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)
+     ✅ Khi chạy: state nằm trong Redis — restart agent vẫn bị 429
+     ✅ Khi chạy: hết budget → 402 — 402 ở request thứ 1
+     ✅ Khi chạy: mọi dòng log của app là JSON hợp lệ — 17 dòng JSON
+     ✅ Khi chạy: SIGTERM lúc đang có request → request vẫn 200, process tự thoát — exit code 0
+     ✅ Docker: `docker stop` tắt êm (exit code 0, < 10s) — exit code 0, 0.8s
+...
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+"402 ở request thứ 1": trong lần chạy cost guard, Redis tạm của script đã có chi phí của các request ở lần chạy trước (khoá `cost:daily:<ngày>` dùng chung cho cả service), nên tổng ngày đã vượt budget `0.000001` USD ngay từ đầu. Với Redis trống, request đầu trả 200 (chi phí ≈ 1.3e-5 USD) và request thứ 2 trả 402.
+
+### Thiết kế
+
+| Thành phần | Cách làm | File |
+|---|---|---|
+| Config | Dataclass đọc mọi giá trị từ env; `AGENT_API_KEY` không có mặc định; `ENVIRONMENT=production` mà thiếu key thì không khởi động | `app/config.py` |
+| Auth | `APIKeyHeader("X-API-Key")`; thiếu **hoặc** sai → 401 (`hmac.compare_digest`); chưa cấu hình key thì từ chối tất cả | `app/auth.py` |
+| Redis | `redis.from_url` không kết nối lúc import → app khởi động được khi chưa có Redis; timeout 1–2s để `/ready` trả 503 nhanh | `app/redis_client.py` |
+| Rate limit | Sliding window 60s bằng sorted set `ratelimit:<sha256(key)[:16]>`; MULTI: ZREMRANGEBYSCORE → ZADD → ZCARD → EXPIRE; vượt thì ZREM lại và trả 429 + `Retry-After` | `app/rate_limiter.py` |
+| Cost guard | Tổng chi phí service trong `cost:daily:<YYYY-MM-DD>` và `cost:monthly:<YYYY-MM>` (INCRBYFLOAT, EXPIRE); ≥ budget → 402; token ước lượng `ceil(len/4)` | `app/cost_guard.py` |
+| Log | `JsonFormatter`: mỗi dòng một JSON (`ts`, `lvl`, `event`, field); middleware ghi `method/path/status/ms/request_id`; không log key hay nội dung câu hỏi | `app/main.py` |
+| Lỗi | 422 gọn theo field (không trả lại input), Redis lỗi → 503 + `Retry-After`, lỗi khác → 500 `Internal server error` (traceback chỉ nằm trong log) | `app/main.py` |
+| Graceful shutdown | Không tự cài handler SIGTERM (bài học Part 1/5); `/ask` là `def` → chạy trong threadpool, không chặn event loop; `lifespan` đặt not-ready và đóng Redis; Docker CMD `exec uvicorn ... --timeout-graceful-shutdown 8` để uvicorn là PID 1 | `app/main.py`, `Dockerfile` |
+| Docker | 2 stage `python:3.11-slim`: builder cài vào `/opt/venv`, runtime chỉ copy venv + `app/` + `utils/`; user `app` non-root; `HEALTHCHECK` theo `PORT` | `Dockerfile`, `.dockerignore` |
+| Compose | `agent` (build, `env_file .env` không bắt buộc, `REDIS_URL=redis://redis:6379/0`, chờ redis healthy) + `redis:7-alpine` (AOF, healthcheck) | `docker-compose.yml` |
+
+### Tự kiểm thêm bằng `docker compose up` (key ngẫu nhiên đặt trong `.env`, đã xoá sau khi thử)
+
+```text
+$ GET /health                              → 200 {"status":"ok","uptime_seconds":2.0,"version":"1.0.0","environment":"development"}
+$ GET /ready                               → 200 {"ready":true,"redis":true}
+$ POST /ask, không có key                  → 401 {"detail":"Missing API key (header X-API-Key)"}
+$ POST /ask, key sai                       → 401 {"detail":"Invalid API key"}
+$ POST /ask, key đúng                      → 200 {"question":"What is deployment?","answer":"Deployment là quá trình đưa code từ máy bạn lên server để người khác dùng được.","usage":{"input_tokens":5,"output_tokens":20,"cost_usd":1.275e-05,"requests_remaining":9}}
+$ POST /ask, question rỗng                 → 422 {"detail":"Invalid request body","errors":[{"field":"question","message":"String should have at least 1 character"}]}
+$ POST /ask, thiếu field question          → 422 {"detail":"Invalid request body","errors":[{"field":"question","message":"Field required"}]}
+$ POST /ask, JSON hỏng                     → 422 {"detail":"Invalid request body","errors":[{"field":"body","message":"JSON decode error"}]}
+$ POST /ask, question 2001 ký tự           → 422 {"detail":"Invalid request body","errors":[{"field":"question","message":"String should have at most 2000 characters"}]}
+$ GET /ask                                 → 405 {"detail":"Method Not Allowed"}
+$ 12 request liên tiếp (limit 10/phút, đã có 1 request thành công ở trên)
+200 200 200 200 200 200 200 200 200 429 429 429
+HTTP/1.1 429 Too Many Requests
+retry-after: 59
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+{"detail":"Rate limit exceeded: 10 requests per 60s"}
+
+$ docker compose stop redis
+$ GET /health (Redis đã tắt)               → 200
+$ GET /ready (Redis đã tắt)                → 503 {"ready":false,"redis":false,"accepting":true}
+$ POST /ask (Redis đã tắt)                 → 503 {"detail":"Service temporarily unavailable"}
+```
+
+Dòng "JSON hỏng" ở lần thử đầu trả `"field":"13"` (vị trí ký tự lỗi); đã sửa thành `"body"` rồi chạy lại script chấm, vẫn PASS 12/12. Các request 422 không bị tính vào rate limit vì FastAPI kiểm body trước khi chạy endpoint.
+
+Log JSON của agent (trích):
+
+```json
+{"ts": "2026-11-25T08:24:55.725+00:00", "lvl": "INFO", "event": "request", "method": "POST", "path": "/ask", "status": 429, "ms": 3.1, "request_id": "8a45c48cc2fe"}
+{"ts": "2026-11-25T08:25:00.256+00:00", "lvl": "INFO", "event": "request", "method": "GET", "path": "/ready", "status": 503, "ms": 4003.1, "request_id": "ffe30cb3cd35"}
+{"ts": "2026-11-25T08:25:04.274+00:00", "lvl": "ERROR", "event": "redis_unavailable", "path": "/ask", "error": "ConnectionError"}
+```
+
+Ghi chú về exit code: chạy **một** process (`uvicorn app.main:app`, không `--workers`) rồi `kill -TERM` thì log vẫn đủ `shutdown` → `Application shutdown complete` → `Finished server process`, nhưng exit code là 143: uvicorn 0.30 tắt xong mới phát lại SIGTERM với handler mặc định. Với `--workers 2` (cách script chấm chạy và CMD trong Dockerfile) process cha thoát 0, khớp `docker stop` → exit code 0.
+
+Khi Redis đã tắt, `/ready` mất ~4s mới trả 503 (tra DNS tên `redis` của container đã dừng cộng timeout kết nối), vẫn trong 15s script cho phép.
 
 ## AI log
 
@@ -413,3 +502,4 @@ Một instance chết, 2 instance còn lại tiếp tục phục vụ, history k
 | 3 | Part 2 | Claude build 2 image, đo size, chạy stack compose, trả lời 2.1/2.3 và vẽ sơ đồ | Số MB từ `docker image inspect`, output curl qua Nginx, sơ đồ | Tự tính lại % chênh từ số byte; đối chiếu sơ đồ với `docker-compose.yml` và `nginx.conf` |
 | 4 | Part 4 | Claude chạy bản develop (API key) và production (JWT), vòng lặp 20 request, giải thích rate limiter và cost guard | Output `curl -i` 401/403/200/429 với token đã che, giải thích thuật toán, cách làm cost guard bằng Redis | Kiểm tra token không còn trong output (đếm = 0); đối chiếu số request trước 429 với limit 10; tự phát hiện lỗi `budget_remaining_usd` trả số đã tiêu |
 | 5 | Part 5 | Claude chạy health/ready, thử SIGTERM khi có 3 request, chạy stack 3 instance, `test_stateless.py` và thử tắt 1 instance | Output, giải thích request bị cắt do `time.sleep` chặn event loop | Đọc `mock_llm.py` (delay 3s) và log uvicorn để xác nhận nguyên nhân; chạy lại sau khi chờ đủ 3 agent healthy; sửa lại nhận định ở Part 1 về handler SIGTERM sau khi thấy thứ tự log |
+| 6 | Part 6 | Claude viết toàn bộ TODO trong `06-lab-complete/` (config, auth, redis_client, rate_limiter, cost_guard, main, Dockerfile, compose, .dockerignore, .env.example, railway.toml, render.yaml) theo hợp đồng của script chấm | Code + docstring giải thích từng quyết định; script chấm PASS 12/12 | Chạy script bản đầy đủ trong WSL (2 lần, trước và sau khi sửa lỗi field `"13"`); tự thử thêm bằng compose các ca lỗi 401/422/405/429/503; đọc từng file trong `app/` để giải thích được khi vấn đáp |
