@@ -174,7 +174,36 @@ Header `Server: nginx` và các security header cho thấy request đi qua Nginx
 
 ## Part 3: Cloud Deployment
 
-(CP6)
+Theo lộ trình K5, Part 3 deploy chính agent Part 6 (`06-lab-complete/`), không deploy app mẫu trong `03-cloud-deployment/`.
+
+### Exercise 3.1: Railway (nền tảng chính)
+
+- URL: https://agent-production-b5ee779c.up.railway.app
+- Nền tảng: Railway, project `k5-day14-agent` gồm service `agent` (build từ `06-lab-complete/Dockerfile`) và database `Redis`; `REDIS_URL=${{Redis.REDIS_URL}}`.
+- Các bước: `railway login` → `railway init` → `railway add --database redis` → `railway add --service agent` → `railway variable set` (key qua stdin) → `railway up -s agent` → `railway domain -s agent`.
+- 4 lệnh tự kiểm CP6: `/health` 200, `/ready` 200, `/ask` không key 401, `/ask` có key 200. `check_production_ready.py --public-url <URL>` → PASS 12/12 (44/44).
+- Chi tiết, biến môi trường và ảnh (`screenshots/dashboard.png`, `running.png`, `test.png`): [DEPLOYMENT.md](DEPLOYMENT.md)
+
+### Exercise 3.2: So sánh `railway.toml` và `render.yaml` (thay cho deploy nền tảng thứ hai)
+
+So sánh hai file mình viết cho agent Part 6 (`06-lab-complete/railway.toml`, `06-lab-complete/render.yaml`):
+
+| Khía cạnh | `railway.toml` | `render.yaml` | Vì sao khác |
+|---|---|---|---|
+| Phạm vi | Cấu hình **một service** (build + deploy). Project, Redis, biến môi trường tạo bằng CLI/dashboard | **Blueprint cả hạ tầng**: web service + Key Value (Redis) + biến môi trường trong một file | Railway coi file là config-as-code của từng service; Render dùng Blueprint làm IaC cho cả project |
+| Build | `builder = "DOCKERFILE"`, `dockerfilePath` | `runtime: docker`, `rootDir: 06-lab-complete`, `dockerfilePath` | Repo có nhiều thư mục; Railway deploy từ thư mục chạy `railway up`, Render đọc repo GitHub nên phải chỉ `rootDir` |
+| Start command / port | Không cần: CMD trong Dockerfile nghe `${PORT}` do Railway cấp | Như Railway: Render cũng cấp `PORT`, dùng CMD của Dockerfile | Cả hai inject `PORT`; vì vậy CMD phải đọc biến, không cố định 8000 |
+| Health check | `healthcheckPath = "/health"`, `healthcheckTimeout = 60` | `healthCheckPath: /health` | Giống nhau về ý nghĩa: deploy mới chỉ nhận traffic khi `/health` 200 |
+| Restart | `restartPolicyType = "ON_FAILURE"`, tối đa 3 lần | Không khai báo, Render tự restart | Railway cho chỉnh policy trong file, Render quản lý ngầm |
+| Redis | Thêm service Redis trong project (`railway add --database redis`), agent đặt `REDIS_URL=${{Redis.REDIS_URL}}` | Khai `type: keyvalue` trong cùng file, agent lấy `fromService ... property: connectionString` | Railway nối service bằng biến tham chiếu; Render nối bằng `fromService` trong Blueprint |
+| Secret | Không có trong file; đặt bằng `railway variable set` (key đọc từ stdin) | `AGENT_API_KEY: generateValue: true` (Render tự sinh) — không ghi giá trị | Không nền tảng nào để secret nằm trong repo |
+| Gói / region | Chọn trên dashboard | `plan: free` trong file | Render khai báo được tài nguyên trong IaC |
+
+So với file mẫu trong `03-cloud-deployment/`: bản mẫu Railway dùng `NIXPACKS` + `startCommand` (tự đoán cách build Python), bản mẫu Render dùng `runtime: python` + `buildCommand`. Mình dùng Dockerfile cho cả hai để image chạy trên cloud giống hệt image đã được script chấm kiểm (multi-stage, non-root, < 500 MB, graceful shutdown).
+
+### Exercise 3.3: Pipeline CI/CD Cloud Run (`03-cloud-deployment/production-cloud-run/`)
+
+`cloudbuild.yaml` là pipeline Cloud Build chạy khi push lên `main`, gồm 4 bước nối tiếp nhau (`waitFor`): (1) **test** — container `python:3.11-slim` cài requirements và chạy `pytest tests/`, fail thì dừng; (2) **build** — build Docker image, gắn tag `$COMMIT_SHA` và `latest`, dùng `--cache-from latest` để tận dụng layer cache; (3) **push** — đẩy cả hai tag lên Container Registry `gcr.io/$PROJECT_ID/ai-agent`; (4) **deploy** — `gcloud run deploy` image đúng tag commit lên Cloud Run ở `asia-southeast1`, public, 1–10 instance (min 1 để tránh cold start), 512Mi/1 CPU, timeout 60s, `ENVIRONMENT=production`, `OPENAI_API_KEY` lấy từ Secret Manager. `service.yaml` mô tả cùng service đó dưới dạng IaC (Knative): concurrency 80 request/instance, `livenessProbe` gọi `/health`, `startupProbe` gọi `/ready`, `AGENT_API_KEY` và `OPENAI_API_KEY` lấy từ Secret Manager — deploy bằng `gcloud run services replace`. Deploy theo tag commit (không theo `latest`) giúp biết chính xác bản nào đang chạy và rollback được.
 
 ## Part 4: API Security
 
@@ -503,3 +532,4 @@ Khi Redis đã tắt, `/ready` mất ~4s mới trả 503 (tra DNS tên `redis` c
 | 4 | Part 4 | Claude chạy bản develop (API key) và production (JWT), vòng lặp 20 request, giải thích rate limiter và cost guard | Output `curl -i` 401/403/200/429 với token đã che, giải thích thuật toán, cách làm cost guard bằng Redis | Kiểm tra token không còn trong output (đếm = 0); đối chiếu số request trước 429 với limit 10; tự phát hiện lỗi `budget_remaining_usd` trả số đã tiêu |
 | 5 | Part 5 | Claude chạy health/ready, thử SIGTERM khi có 3 request, chạy stack 3 instance, `test_stateless.py` và thử tắt 1 instance | Output, giải thích request bị cắt do `time.sleep` chặn event loop | Đọc `mock_llm.py` (delay 3s) và log uvicorn để xác nhận nguyên nhân; chạy lại sau khi chờ đủ 3 agent healthy; sửa lại nhận định ở Part 1 về handler SIGTERM sau khi thấy thứ tự log |
 | 6 | Part 6 | Claude viết toàn bộ TODO trong `06-lab-complete/` (config, auth, redis_client, rate_limiter, cost_guard, main, Dockerfile, compose, .dockerignore, .env.example, railway.toml, render.yaml) theo hợp đồng của script chấm | Code + docstring giải thích từng quyết định; script chấm PASS 12/12 | Chạy script bản đầy đủ trong WSL (2 lần, trước và sau khi sửa lỗi field `"13"`); tự thử thêm bằng compose các ca lỗi 401/422/405/429/503; đọc từng file trong `app/` để giải thích được khi vấn đáp |
+| 7 | Part 3 | Claude đưa lệnh Railway CLI, viết so sánh `railway.toml`/`render.yaml`, mô tả pipeline Cloud Run, viết `DEPLOYMENT.md` | Lệnh deploy, bảng so sánh, đoạn 3.3 | Tự đăng nhập Railway, tạo project, đặt biến (key qua stdin) và deploy; tự chạy 4 lệnh CP6 và chụp ảnh; đối chiếu đoạn 3.3 với `cloudbuild.yaml`, `service.yaml` |
