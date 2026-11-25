@@ -178,7 +178,108 @@ Header `Server: nginx` và các security header cho thấy request đi qua Nginx
 
 ## Part 4: API Security
 
-(CP3)
+### Exercise 4.1: API key (`04-api-gateway/develop/app.py`)
+
+- **Check ở đâu:** hàm `verify_api_key` (dòng 39–54) đọc header `X-API-Key` qua `APIKeyHeader(name="X-API-Key", auto_error=False)`, được gắn vào `/ask` bằng `Depends(verify_api_key)` (dòng 70). Key đúng lấy từ env `AGENT_API_KEY` (dòng 35).
+- **Sai key:** thiếu header → **401** `Missing API key`; có header nhưng sai → **403** `Invalid API key`. (Part 6 yêu cầu cả hai trường hợp trả 401.)
+- **Rotate key:** đổi giá trị `AGENT_API_KEY` trên nền tảng rồi restart/redeploy; không phải sửa code. Muốn không gián đoạn thì cho phép tạm thời hai key (cũ + mới, ví dụ `AGENT_API_KEYS=k1,k2`), chuyển client sang key mới, rồi bỏ key cũ. Bản demo có điểm yếu: nếu quên đặt env thì rơi về key mặc định `demo-key-change-in-production`, và khi chạy còn in key ra console.
+
+Chạy với `AGENT_API_KEY=secret-key-123 python app.py`:
+
+```text
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: wrong-key" -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid API key."}
+
+$ curl -i -X POST http://localhost:8000/ask -H "X-API-Key: secret-key-123" -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
+### Exercise 4.2: JWT (`04-api-gateway/production/`)
+
+**Flow:** `POST /auth/token` với username/password → `authenticate_user` kiểm tra `DEMO_USERS` → `create_token` ký payload `{sub, role, iat, exp = +60 phút}` bằng HS256 với `JWT_SECRET` → client gửi `Authorization: Bearer <token>` → `verify_token` kiểm chữ ký và hạn, lấy `username`, `role` mà không cần tra DB (stateless). Hết hạn → 401 `Token expired`; token sai chữ ký/định dạng → 403.
+
+```text
+$ curl -i -X POST http://localhost:8000/ask -H "Content-Type: application/json" -d '{"question": "Explain JWT"}'   # không có token
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+$ curl -s -X POST http://localhost:8000/auth/token -H "Content-Type: application/json" -d '{"username": "student", "password": "demo123"}'
+{"access_token":"eyJhbGciOiJI…(đã che)","token_type":"bearer","expires_in_minutes":60,"hint":"Include in header: Authorization: Bearer …(đã che)"}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"question": "Explain JWT"}'
+HTTP/1.1 200 OK
+{"question":"Explain JWT","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận.","usage":{"requests_remaining":9,"budget_remaining_usd":1.9e-05}}
+
+$ curl -i -X POST http://localhost:8000/ask -H "Authorization: Bearer invalid.token.here" ...   # token sai
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid token."}
+```
+
+### Exercise 4.3: Rate limiting
+
+- **Thuật toán:** sliding window log — mỗi user một `deque` timestamp; mỗi request xoá timestamp cũ hơn 60 giây, nếu còn ≥ `max_requests` thì trả 429 kèm `Retry-After` (tính từ timestamp cũ nhất), không thì thêm timestamp hiện tại (`rate_limiter.py`).
+- **Limit:** role `user` 10 request/60 giây; role `admin` 100 request/60 giây.
+- **"Bypass" cho admin:** `app.py` chọn limiter theo role trong JWT (`rate_limiter_admin if role == "admin"`), nên tài khoản `teacher` (admin) có hạn mức 100/phút. Muốn bỏ hẳn thì bỏ qua `limiter.check()` khi role là admin — nhưng vẫn nên giữ một hạn mức để chặn token admin bị lộ.
+- **Hạn chế:** state nằm trong RAM của process → chạy nhiều instance/worker thì mỗi nơi đếm riêng, restart là mất. Part 6 chuyển sang Redis.
+
+20 request liên tiếp bằng cùng token `student` (1 request đã dùng ở 4.2):
+
+```text
+$ for i in {1..20}; do curl -s -o /dev/null -w "$i: %{http_code}\n" -X POST http://localhost:8000/ask -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"question\": \"Test $i\"}"; done
+1: 200
+2: 200
+...
+9: 200
+10: 429
+11: 429
+...
+20: 429
+
+$ curl -i ... (request thứ 21)
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+retry-after: 58
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":58}}
+```
+
+Request 200 thứ 10 của cửa sổ là lần 9 trong vòng lặp (cộng 1 request ở 4.2), từ lần 10 trở đi bị 429.
+
+### Exercise 4.4: Cost guard
+
+**Bản mẫu (`cost_guard.py`):** trước khi gọi LLM, `check_budget(user)` từ chối với **402** nếu chi phí hôm nay của user ≥ `daily_budget_usd` ($1/ngày), và **503** nếu tổng toàn hệ thống ≥ $10/ngày; sau khi gọi, `record_usage` cộng token vào bản ghi và tính tiền theo giá GPT-4o-mini ($0.15/1M input, $0.60/1M output); cảnh báo log khi dùng ≥ 80%. Sau 10 request, `/me/usage` báo:
+
+```text
+{"user_id":"student","date":"2026-11-25","requests":10,"input_tokens":40,"output_tokens":288,"cost_usd":0.000179,"budget_usd":1.0,"budget_remaining_usd":0.999821,"budget_used_pct":0.0}
+```
+
+Hai lỗi của bản mẫu: state trong RAM (giống rate limiter), và `/ask` trả `"budget_remaining_usd": usage.total_cost_usd`, tức là số **đã tiêu** chứ không phải số còn lại (`1.9e-05` ở 4.2).
+
+**Cách mình làm (dùng ở Part 6, state trong Redis):**
+
+```python
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    month_key = datetime.now(timezone.utc).strftime("%Y-%m")
+    key = f"budget:{user_id}:{month_key}"
+    current = float(r.get(key) or 0)
+    if current + estimated_cost > MONTHLY_BUDGET_USD:   # $10/tháng
+        return False                                    # API trả 402
+    r.incrbyfloat(key, estimated_cost)                  # cộng dồn atomic, mọi instance thấy chung
+    r.expire(key, 32 * 24 * 3600)                       # tự xoá sau tháng → reset đầu tháng
+    return True
+```
+
+- Khoá theo tháng (`%Y-%m`) nên sang tháng mới tự dùng khoá mới, không cần job reset; `EXPIRE` 32 ngày để Redis tự dọn khoá cũ.
+- `INCRBYFLOAT` là atomic nên nhiều worker/instance cộng cùng lúc không bị mất số.
+- Ở Part 6 tách thành `check_budget()` (trước khi gọi LLM, chỉ đọc) và `record_cost()` (sau khi gọi, cộng chi phí thật), theo dõi song song khoá ngày (`DAILY_BUDGET_USD`) và khoá tháng (`MONTHLY_BUDGET_USD`). Mock LLM không trả số token nên ước lượng `ceil(len(text)/4)` token cho input và output.
+- **Rate limit vs cost guard:** rate limit chặn *tốc độ* (chống spam/DoS, chia tài nguyên công bằng), cost guard chặn *tổng tiền* (một user gửi chậm nhưng prompt dài vẫn có thể đốt hết budget). Cần cả hai vì mỗi cái bỏ lọt trường hợp mà cái kia bắt được.
 
 ## Part 5: Scaling & Reliability
 
@@ -195,3 +296,4 @@ Header `Server: nginx` và các security header cho thấy request đi qua Nginx
 | 1 | Chuẩn bị | Claude Code (Opus) đọc đề, lập kế hoạch theo checkpoint, cài môi trường WSL2 + venv | Kế hoạch CP0–CP8, hai venv (Part 6/7 dùng `pydantic==2.9.0`, Part 4 production cần `>=2.11`) | Tự cài Ubuntu và `uv`, kiểm `python --version` = 3.11.18, `os.name` = `posix` |
 | 2 | Part 1 | Claude chạy bản develop/production, liệt kê anti-pattern kèm dòng code | Bảng 1.1, 1.3 và output curl | Đối chiếu từng dòng với `develop/app.py`; tự xem log server để xác nhận key bị in ra và log JSON của bản production không hiện |
 | 3 | Part 2 | Claude build 2 image, đo size, chạy stack compose, trả lời 2.1/2.3 và vẽ sơ đồ | Số MB từ `docker image inspect`, output curl qua Nginx, sơ đồ | Tự tính lại % chênh từ số byte; đối chiếu sơ đồ với `docker-compose.yml` và `nginx.conf` |
+| 4 | Part 4 | Claude chạy bản develop (API key) và production (JWT), vòng lặp 20 request, giải thích rate limiter và cost guard | Output `curl -i` 401/403/200/429 với token đã che, giải thích thuật toán, cách làm cost guard bằng Redis | Kiểm tra token không còn trong output (đếm = 0); đối chiếu số request trước 429 với limit 10; tự phát hiện lỗi `budget_remaining_usd` trả số đã tiêu |
