@@ -583,6 +583,61 @@ agent_question_length_chars_count 3.0
 agent_question_length_chars_sum 139.0
 ```
 
+### Exercise 7.4: Observability stack
+
+- Stack chạy bằng `docker compose -p k5-day14-observability up -d --build`.
+- Phải sửa `production/Dockerfile` (thêm `ENV PYTHONUSERBASE=/home/agent/.local`), vì bản gốc làm agent crash `No module named 'uvicorn'`. Chi tiết ở đầu `BENCHMARK_REPORT.md`.
+- Tải: Locust 30 user, 3 instance. Số đo lúc 16:38, ảnh ở [screenshots/grafana-dashboard.png](screenshots/grafana-dashboard.png).
+
+**1. p95 và avg là bao nhiêu, khoảng cách nói lên điều gì?**
+- **Số đo:** p95 = 292 ms (PromQL 0.2916 s, panel ghi 292.05 ms), avg = 224 ms, p50 = 176 ms, p99 = 1774 ms.
+- **Ý nghĩa:**
+  - avg và p95 gần nhau, nên 95% request đều nhanh.
+  - Khoảng cách lớn nằm giữa p95 và p99 (292 → 1774 ms): khoảng 3% request rơi vào đuôi chậm 1.5 s của LLM mock.
+  - Avg kéo lên 224 ms (cao hơn p50 48 ms) chính vì phần đuôi đó, nhưng nhìn avg thì không biết có người chờ gần 2 s.
+
+**2. Nginx có chia đều traffic không?**
+- **Có.** `sum by (instance) (rate(http_requests_total{route="/ask"}[1m]))` = 6.31 / 6.49 / 6.07 req/s cho 3 instance, lệch < 7%.
+- Nginx dùng round-robin, kèm `keepalive 32`. Với 30 user, các kết nối giữ lại vẫn trải đều.
+- Ở benchmark scale 3 instance (100 user), mức chia là 20.24 / 20.11 / 20.62 req/s.
+
+**3. Vì sao input tokens/s lớn hơn output tokens/s?**
+- **Số đo:** input 1520 tokens/s, output 828 tokens/s.
+- **Lý do:** với agent v2, prompt = system prompt + tài liệu retrieve được + câu hỏi. Câu trả lời của mock chỉ là chính tài liệu đó. Vì vậy input luôn dài hơn output đúng bằng phần system prompt và câu hỏi.
+- **Hệ quả:** khi đổi sang v1 (không retrieval), input giảm còn 697 tokens/s. Giá output đắt gấp 4 lần input (0.0006 so với 0.00015 USD/1K), nên dù ít token hơn, output vẫn chiếm phần lớn chi phí.
+
+**4. `curl http://localhost:8080/metrics` trả về gì? Vì sao?**
+- **Kết quả:** `HTTP/1.1 404 Not Found`.
+- **Lý do:** `nginx.conf` có `location = /metrics { return 404; }`. Metric chứa thông tin nội bộ (số request, cost, version, model), không nên công khai ra Internet. Một client lạ gọi `/metrics` liên tục còn tốn CPU của agent.
+- **Prometheus vẫn đọc được metric:** nó scrape thẳng từng container `agent:8000` qua mạng nội bộ `obs_net` (`dns_sd_configs`), không đi qua Nginx. Cách này cũng cho đúng số liệu *từng instance*. Nếu scrape qua load balancer, mỗi lần sẽ trúng một instance khác nhau.
+
+### Exercise 7.5: Tracing
+
+- **Trace chậm nhất:** `452bea0c6d167e569da3889c574b9870`, tổng 2680.3 ms ([ảnh](screenshots/jaeger-slow-trace.png)). Span chậm nhất là `chat mock-llm-small` (1784.9 ms, 66.6%). Retrieval chỉ 116.3 ms (4.3%).
+- **Trace lỗi:** `8ea52e813dc66ddef2c2ad75fcf1bb2f` ([ảnh](screenshots/jaeger-error-trace.png)). Lấy `trace_id` từ dòng log `llm_error` đầu tiên, dán vào Jaeger. Span `chat mock-llm-small` có event `exception`: `LLMError: Upstream LLM error: 503 Service Unavailable (mock)`.
+- Cây span, log JSON khớp `trace_id`, và phân tích 779 ms nằm ngoài `agent.run` (CPU bão hoà): xem `BENCHMARK_REPORT.md` mục 4.1 và 4.3.
+
+### Exercise 7.6: Alerts
+
+- **Unit test alert rules:** `docker run --rm -v "$PWD/prometheus:/p" --entrypoint promtool prom/prometheus:v3.16.0 test rules /p/alert_rules_test.yml` cho kết quả `SUCCESS`.
+- **Đã làm đủ 5 thí nghiệm A–E**, bảng đầy đủ ở `BENCHMARK_REPORT.md` mục 4.2. Thời gian từ lúc đổi tới lúc firing:
+  - A `AgentHighErrorRate`: 86.2 s
+  - B `AgentHighLatencyP95`: 142.3 s
+  - C `LLMCostBurnRateHigh`: 136.3 s
+  - D `AgentInstanceDown`: 44.2 s
+- Ảnh [screenshots/prometheus-alert-firing.png](screenshots/prometheus-alert-firing.png) thấy A và D cùng firing.
+
+**Câu hỏi: `AGENT_VERSION=v1` không làm alert nào firing. Phát hiện bằng cách nào?**
+
+- **Vì sao không có alert:** request vẫn 200, nhanh (p95 198 ms), error rate 1.03%. Bốn Golden Signals chỉ đo hạ tầng, không đo câu trả lời đúng hay sai.
+- **Cách phát hiện:**
+  1. **Trước khi deploy:** job CI quality gate (`.github/workflows/eval.yml`) chạy golden dataset và trả exit code 1 khi accuracy < 85% hoặc có regression. Đã thử với v1: 4.3%, 20 câu regression, exit code 1.
+  2. **Sau khi deploy:**
+     - chạy eval canary định kỳ trên production, xuất điểm thành metric để có alert;
+     - alert theo tín hiệu gián tiếp: retrieval hit ratio (`absent()` hoặc < 0.8), token/request giảm 53% như đo được;
+     - feedback 👎 của người dùng;
+     - annotation đổi version từ `agent_info` trên dashboard.
+
 ## AI log
 
 | # | Phần | Hỏi AI gì | Nhận được gì | Tôi tự sửa / tự kiểm tra thế nào |
@@ -595,3 +650,4 @@ agent_question_length_chars_sum 139.0
 | 6 | Part 6 | Claude viết toàn bộ TODO trong `06-lab-complete/` (config, auth, redis_client, rate_limiter, cost_guard, main, Dockerfile, compose, .dockerignore, .env.example, railway.toml, render.yaml) theo hợp đồng của script chấm | Code + docstring giải thích từng quyết định; script chấm PASS 12/12 | Chạy script bản đầy đủ trong WSL (2 lần, trước và sau khi sửa lỗi field `"13"`); tự thử thêm bằng compose các ca lỗi 401/422/405/429/503; đọc từng file trong `app/` để giải thích được khi vấn đáp |
 | 7 | Part 3 | Claude đưa lệnh Railway CLI, viết so sánh `railway.toml`/`render.yaml`, mô tả pipeline Cloud Run, viết `DEPLOYMENT.md` | Lệnh deploy, bảng so sánh, đoạn 3.3 | Tự đăng nhập Railway, tạo project, đặt biến (key qua stdin) và deploy; tự chạy 4 lệnh CP6 và chụp ảnh; đối chiếu đoạn 3.3 với `cloudbuild.yaml`, `service.yaml` |
 | 8 | Part 7 (develop) | Claude chạy agent v1/v2, load test 4 mức concurrency và 3 mức `MOCK_SLOW_RATE`, eval v1/v2; viết 2 entry `KNOWLEDGE_BASE` theo `missing_keywords`, thêm metric `agent_question_length_chars`, viết job CI `.github/workflows/eval.yml`, điền `BENCHMARK_REPORT.md` mục 1–3 | Các file `reports/*.json`, câu trả lời 7.1, nhận xét bảng 2.1/2.2/3 | Không chép KB của lời giải mẫu: tự viết nội dung, kiểm golden dataset trước để chắc keyword mới không đổi câu khác (eval cuối: 23/23, 0 regression). Thấy c=100 RPS tụt thì không đoán mà chạy thêm thí nghiệm (đo latency trong agent, `ListenOverflows`, chia 2 tiến trình client). Đối chiếu từng số trong báo cáo với JSON, sửa 2 chỗ (tỉ lệ 16/299 = 5.35%, ghi thêm lượt chạy lại có error rate 2.33%) |
+| 9 | Part 7 (production) | Claude bật stack observability, chạy Locust headless scale 1/3, tìm trace chậm/lỗi qua API Jaeger, làm 5 thí nghiệm A–E và đo thời gian tới lúc firing bằng script poll Prometheus, điền `BENCHMARK_REPORT.md` mục 4–6 và Exercise 7.4–7.6 | Số liệu, trace_id kèm log JSON, bảng A–E, giải thích scaling | Tự chụp 4 ảnh (Grafana, 2 trace Jaeger, Prometheus Alerts) đúng lúc alert firing. Không nhận số "đẹp" mà kiểm lại: lượt Locust đầu toàn 502 nên tìm ra lỗi `PYTHONUSERBASE` trong Dockerfile; scale_3 tệ hơn scale_1 nên đếm container và phát hiện `docker compose run` đưa agent về 2 replica, chạy lại với `--no-deps`, giữ lượt sai làm bằng chứng. Đối chiếu bảng scaling với CSV và `docker stats` |

@@ -26,6 +26,10 @@ RUN chown -R agent:agent /app
 USER agent
 
 ENV PATH=/home/agent/.local/bin:$PATH
+# Sửa lỗi của đề: user "agent" có home = /app (useradd -d /app), nên Python tìm user site-packages
+# ở /app/.local và container crash "No module named 'uvicorn'". Trỏ về nơi đã COPY package
+# (giống 05-scaling-reliability/production/Dockerfile).
+ENV PYTHONUSERBASE=/home/agent/.local
 ENV PYTHONPATH=/app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
