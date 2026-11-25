@@ -77,7 +77,100 @@ $ curl -s -X POST http://localhost:8000/ask -H "Content-Type: application/json" 
 
 ## Part 2: Docker
 
-(CP2)
+### Exercise 2.1: Đọc `02-docker/develop/Dockerfile`
+
+1. **Base image:** `python:3.11` (dòng 8) — bản Debian đầy đủ, có sẵn compiler và nhiều thư viện hệ thống, nên rất nặng.
+2. **Working directory:** `/app` (dòng 11). Mọi `COPY`, `RUN`, `CMD` sau đó chạy tương đối từ đây.
+3. **Vì sao `COPY requirements.txt` trước:** Docker cache theo từng layer, layer nào đổi thì mọi layer sau phải build lại. Dependencies ít đổi, code đổi liên tục. Copy `requirements.txt` rồi `pip install` trước (dòng 14–17), sau đó mới copy code (dòng 20) ⇒ sửa code chỉ build lại từ layer `COPY app.py`, không cài lại thư viện. Đảo thứ tự thì mỗi lần sửa một dòng code là cài lại toàn bộ dependencies.
+4. **CMD vs ENTRYPOINT:** `CMD` là lệnh/tham số mặc định, bị thay hoàn toàn khi chạy `docker run image <lệnh khác>`. `ENTRYPOINT` là chương trình cố định của container; tham số của `docker run` được nối vào sau nó (muốn đổi phải dùng `--entrypoint`). Dùng chung thì `ENTRYPOINT` là executable, `CMD` là tham số mặc định. Cả hai nên viết dạng exec (`["..."]`) để process là PID 1 và nhận được SIGTERM.
+
+### Exercise 2.2: Build và chạy bản develop
+
+Build từ gốc repo: `docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .`, chạy `docker run -p 8000:8000 my-agent:develop`.
+
+```text
+$ curl -s -X POST "http://localhost:8000/ask?question=What%20is%20Docker%3F"
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+$ curl -s http://localhost:8000/health
+{"status":"ok","uptime_seconds":0.7,"container":true}
+```
+
+### Exercise 2.3: Multi-stage build và kích thước image
+
+- **Stage 1 (`builder`, `python:3.11-slim`):** cài `gcc`, `libpq-dev` để biên dịch được các gói cần build, rồi `pip install --user -r requirements.txt` vào `/root/.local`. Stage này chỉ để build, không được deploy.
+- **Stage 2 (`runtime`, `python:3.11-slim`):** tạo user `appuser` không phải root, chỉ copy `/root/.local` (thư viện đã cài) từ builder, copy `main.py` và `utils/mock_llm.py`, chạy bằng `USER appuser`, có `HEALTHCHECK` gọi `/health`, `CMD` dạng exec chạy uvicorn 2 worker.
+- **Vì sao nhỏ hơn:** (1) base `slim` thay cho bản đầy đủ; (2) `gcc`, header `libpq-dev`, cache `apt` nằm lại ở stage builder, không có trong image cuối; (3) `--no-cache-dir` nên không mang cache của pip; (4) chỉ copy đúng file cần chạy.
+
+Đo bằng `docker images` sau khi build cả hai:
+
+```text
+$ docker images my-agent --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}"
+REPOSITORY:TAG      SIZE
+my-agent:advanced   240MB
+my-agent:develop    1.67GB
+$ docker image inspect -f "{{.Size}}" my-agent:develop my-agent:advanced
+my-agent:develop 1667784208 bytes
+my-agent:advanced 239815467 bytes
+```
+
+- Develop: **1667.8 MB**
+- Production (multi-stage): **239.8 MB**
+- Chênh lệch: production nhỏ hơn **85.6%** (`(1667.8 − 239.8) / 1667.8`), tức nhỏ hơn khoảng 7 lần. Lớn hơn mức 50–70% thường gặp vì bản develop dùng `python:3.11` đầy đủ.
+
+### Exercise 2.4: Docker Compose stack
+
+Chạy `touch .env.local` rồi `docker compose -p k5-day14-docker up -d --build` trong `02-docker/production/`.
+
+```text
+SERVICE   IMAGE                   STATUS                    PORTS
+agent     k5-day14-docker-agent   Up (health: starting)     8000/tcp
+nginx     nginx:alpine            Up                        0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp
+qdrant    qdrant/qdrant:v1.9.0    Up 11 seconds (healthy)   6333-6334/tcp
+redis     redis:7-alpine          Up 11 seconds (healthy)   6379/tcp
+```
+
+Sơ đồ (mạng bridge `internal`; chỉ Nginx mở cổng ra máy chủ):
+
+```text
+                    máy chủ :80 / :443
+                           │
+                   ┌───────▼────────┐
+  client ─────────▶│ nginx:alpine   │  reverse proxy + LB (upstream agent:8000),
+                   │                │  rate limit 10 r/s/IP, security headers
+                   └───────┬────────┘
+                           │ http://agent:8000   (mạng internal)
+                   ┌───────▼────────┐
+                   │ agent (FastAPI)│  build từ 02-docker/production/Dockerfile, target runtime
+                   └───┬────────┬───┘
+     redis://redis:6379│        │http://qdrant:6333
+              ┌────────▼──┐  ┌──▼──────────┐
+              │ redis:7   │  │ qdrant 1.9  │
+              │ (session, │  │ (vector DB  │
+              │ rate limit)│ │  cho RAG)   │
+              └───────────┘  └─────────────┘
+   volumes: redis_data, qdrant_data
+```
+
+- Service được start: `redis`, `qdrant` (chờ healthy), rồi `agent` (`depends_on: condition: service_healthy`), rồi `nginx`.
+- Giao tiếp: các service gọi nhau bằng tên service qua DNS nội bộ của Docker trên mạng `internal`; agent không mở cổng ra ngoài, mọi request đi qua Nginx.
+
+Test qua Nginx:
+
+```text
+$ curl -s -i http://localhost/health
+HTTP/1.1 200 OK
+Server: nginx
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+{"status":"ok","uptime_seconds":1.3,"version":"2.0.0","timestamp":"2026-11-25T07:59:47.512632"}
+
+$ curl -s -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question": "Explain microservices"}'
+HTTP/1.1 200 OK
+Server: nginx
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
+Header `Server: nginx` và các security header cho thấy request đi qua Nginx. Log Nginx có một dòng `connect() failed (111: Connection refused)` lúc agent mới start: `nginx` chỉ `depends_on: agent` (đợi container chạy, không đợi healthy), nên request đến sớm bị lỗi tới khi uvicorn sẵn sàng. Log agent vẫn có dòng JSON lồng chuỗi không hợp lệ (`"msg":"{"event": "request", ...}"`) giống lỗi đã gặp ở Part 1. Xong thì `docker compose -p k5-day14-docker down -v`.
 
 ## Part 3: Cloud Deployment
 
@@ -101,3 +194,4 @@ $ curl -s -X POST http://localhost:8000/ask -H "Content-Type: application/json" 
 |---|---|---|---|---|
 | 1 | Chuẩn bị | Claude Code (Opus) đọc đề, lập kế hoạch theo checkpoint, cài môi trường WSL2 + venv | Kế hoạch CP0–CP8, hai venv (Part 6/7 dùng `pydantic==2.9.0`, Part 4 production cần `>=2.11`) | Tự cài Ubuntu và `uv`, kiểm `python --version` = 3.11.18, `os.name` = `posix` |
 | 2 | Part 1 | Claude chạy bản develop/production, liệt kê anti-pattern kèm dòng code | Bảng 1.1, 1.3 và output curl | Đối chiếu từng dòng với `develop/app.py`; tự xem log server để xác nhận key bị in ra và log JSON của bản production không hiện |
+| 3 | Part 2 | Claude build 2 image, đo size, chạy stack compose, trả lời 2.1/2.3 và vẽ sơ đồ | Số MB từ `docker image inspect`, output curl qua Nginx, sơ đồ | Tự tính lại % chênh từ số byte; đối chiếu sơ đồ với `docker-compose.yml` và `nginx.conf` |
