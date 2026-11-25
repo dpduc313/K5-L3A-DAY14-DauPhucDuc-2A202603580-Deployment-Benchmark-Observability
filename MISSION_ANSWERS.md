@@ -73,7 +73,7 @@ $ curl -s -X POST http://localhost:8000/ask -H "Content-Type: application/json" 
 **Hai điểm bản production vẫn chưa đúng (phát hiện khi chạy):**
 
 1. **Log JSON không hiện ra.** `config.py` gọi `logging.warning(...)` lúc import (dòng `validate()`), việc này tự cấu hình root logger ở mức WARNING. Vì vậy `logging.basicConfig(...)` trong `app.py` không còn tác dụng, và mọi `logger.info(json.dumps(...))` (startup, `agent_request`, shutdown) không được in. Log server ở trên chỉ có dòng `WARNING:root:OPENAI_API_KEY not set` và log của uvicorn. Thêm nữa, format `'{"msg":"%(message)s"}'` bọc một chuỗi JSON trong dấu ngoặc kép nên cũng không phải JSON hợp lệ. Ở Part 6 mình tự viết `logging.Formatter` dùng `json.dumps` cho cả dòng.
-2. **Handler SIGTERM tự viết không chạy.** `signal.signal(SIGTERM, handle_sigterm)` đăng ký lúc import, nhưng `uvicorn.run()` cài handler riêng khi khởi động server và đè lên. Graceful shutdown ở đây thực chất do uvicorn + `lifespan` lo. Ở Part 6 dùng `lifespan`, không đè handler của uvicorn.
+2. **Handler SIGTERM tự viết không làm graceful shutdown.** `signal.signal(SIGTERM, handle_sigterm)` đăng ký lúc import, nhưng `uvicorn.run()` tạm thay bằng handler của uvicorn trong lúc server chạy, và chỉ gọi lại handler cũ **sau khi** đã tắt xong. Ở Part 5 thấy rõ: dòng `Received signal 15` nằm sau `Finished server process`. Graceful shutdown thực chất do uvicorn + `lifespan` lo; handler tự viết chỉ in log muộn. Ở Part 6 dùng `lifespan`, không tự cài handler SIGTERM.
 
 ## Part 2: Docker
 
@@ -283,7 +283,122 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 
 ## Part 5: Scaling & Reliability
 
-(CP4)
+### Exercise 5.1: Health check và readiness (`05-scaling-reliability/develop/app.py`)
+
+- **`/health` (liveness):** "process còn sống không?" — trả 200 kèm uptime, version, kiểm tra bộ nhớ. Nền tảng gọi định kỳ; fail liên tục thì **restart** container. Không được phụ thuộc Redis/DB, nếu không Redis chập chờn sẽ kéo theo restart hàng loạt agent vô ích.
+- **`/ready` (readiness):** "nhận traffic được chưa?" — 503 khi đang khởi động (`_is_ready = False`), đang tắt, hoặc dependency (Redis/DB) chưa kết nối được. Load balancer **ngừng gửi traffic** vào instance đó nhưng không giết nó.
+
+```text
+$ curl -s -i http://localhost:8000/health
+HTTP/1.1 200 OK
+{"status":"ok","uptime_seconds":0.4,"version":"1.0.0","environment":"development","timestamp":"2026-11-25T08:12:49.651459+00:00","checks":{"memory":{"status":"ok","note":"psutil not installed"}}}
+$ curl -s -i http://localhost:8000/ready
+HTTP/1.1 200 OK
+{"ready":true,"in_flight_requests":1}
+```
+
+### Exercise 5.2: Graceful shutdown
+
+Bản develop: `lifespan` đặt `_is_ready = False` khi tắt (để `/ready` trả 503, LB ngừng gửi request mới), middleware đếm `_in_flight_requests`, rồi chờ tối đa 30 giây cho các request đang chạy xong; `uvicorn.run(..., timeout_graceful_shutdown=30)`.
+
+Thử: gửi 3 request `/ask` cùng lúc (mock LLM chờ 3 giây), 0.3 giây sau `kill -TERM`:
+
+```text
+15:16:02.569 gửi 3 request
+15:16:02.884 kill -TERM
+15:16:05.820 process thoát, exit code 0
+request 1: HTTP 200, 3.05s
+request 2: HTTP 000, 3.05s
+request 3: HTTP 000, 3.05s
+
+INFO:     Shutting down
+INFO:     127.0.0.1:39406 - "POST /ask?question=Long%20task%201 HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+2026-11-25 15:16:05,736 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 15:16:05,737 INFO ✅ Shutdown complete
+INFO:     Finished server process [2673]
+2026-11-25 15:16:05,739 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+**Giải thích:**
+
+- Request 1 đang được xử lý lúc SIGTERM đến → uvicorn chờ nó xong (200) rồi mới tắt, exit code 0. Đây là graceful shutdown đúng nghĩa.
+- Request 2 và 3 bị cắt (`000` = kết nối đóng, không có response). Nguyên nhân: `ask_agent` là `async def` nhưng gọi `ask()` dùng `time.sleep(3)` — một lệnh **chặn event loop**. Trong 3 giây đó uvicorn không đọc được hai request kia; khi request 1 xong thì server đã ở trạng thái shutdown và đóng các kết nối chưa bắt đầu xử lý. Lần chạy đầu (gửi `kill` sau 0.05s) cũng thấy request bị xếp hàng: 2/3 request trả 200 nhưng mỗi cái mất ~6.1s thay vì ~3s, request còn lại không có kết quả.
+- Bài học cho Part 6: gọi LLM (blocking) trong endpoint `def` thường (FastAPI chạy trong threadpool) hoặc dùng client async, để request song song đều được nhận và hoàn thành khi tắt.
+- Dòng `Received signal 15` in **sau** `Finished server process`: handler `signal.signal` tự viết chỉ được uvicorn gọi lại sau khi đã tắt xong, nên không góp phần vào graceful shutdown.
+
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
+
+Bản production lưu session/history vào Redis (`save_session` → `SETEX session:<id>` TTL 1 giờ, `load_session` → `GET`), giữ tối đa 20 message. Mỗi instance có `INSTANCE_ID` riêng, trả về trong `served_by`.
+
+**Vì sao phải stateless:** khi chạy nhiều instance sau load balancer, mỗi request của cùng một user có thể vào instance khác. Nếu history nằm trong RAM (`conversation_history = {}`), instance B không thấy những gì user nói với instance A; instance restart/scale down là mất hết. Đưa state ra Redis thì instance nào cũng đọc được, instance trở nên thay thế được (scale, rolling deploy, crash đều không mất dữ liệu). Lưu ý: code có nhánh fallback `_memory_store` khi không kết nối được Redis — tiện cho dev nhưng ở production nên fail `/ready` thay vì âm thầm quay về state trong RAM.
+
+### Exercise 5.4: Load balancing (3 instance + Nginx)
+
+`docker compose -p k5-day14-scaling up -d --build --scale agent=3` trong `05-scaling-reliability/production/` (cổng 8080, endpoint `POST /chat`). Đợi cả 3 agent healthy rồi gửi 10 request:
+
+```text
+k5-day14-scaling-agent-1 Up 7 seconds (healthy)
+k5-day14-scaling-agent-2 Up 7 seconds (healthy)
+k5-day14-scaling-agent-3 Up 6 seconds (healthy)
+
+HTTP  served_by
+200 instance-617a40
+200 instance-3331be
+200 instance-29ba98
+200 instance-617a40
+200 instance-3331be
+200 instance-29ba98
+200 instance-617a40
+200 instance-3331be
+200 instance-29ba98
+200 instance-617a40
+→ 4 / 3 / 3 request
+```
+
+Nginx chia **round-robin** đều cho 3 instance (`upstream agent_cluster { server agent:8000; }`, Docker DNS trả về IP của cả 3 container). Lần chạy đầu tiên mình gửi ngay khi agent-3 còn `health: starting` thì 9/10 request không có body; chờ cả 3 healthy mới gửi thì 10/10 trả 200 — cũng là lý do cần readiness và `depends_on: condition: service_healthy`.
+
+### Exercise 5.5: Test stateless
+
+```text
+$ python test_stateless.py
+Session ID: 99c26c2a-5c7b-483f-8dad-279d3ed21f52
+Request 1: [instance-bf5560]  Q: What is Docker?
+Request 2: [instance-e78192]  Q: Why do we need containers?
+Request 3: [instance-bf5560]  Q: What is Kubernetes?
+Request 4: [instance-e6dd4d]  Q: How does load balancing work?
+Request 5: [instance-e78192]  Q: What is Redis used for?
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-e78192', 'instance-e6dd4d', 'instance-bf5560'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  ... (đủ 5 cặp user/assistant)
+✅ Session history preserved across all instances via Redis!
+```
+
+5 câu của **một** session đi qua cả 3 instance, nhưng history vẫn đủ 10 message theo đúng thứ tự → state không nằm trong instance nào.
+
+Script không tự tắt instance, nên mình thử thêm: mở session, `docker stop` một agent, rồi hỏi tiếp cùng `session_id`:
+
+```text
+$ docker stop k5-day14-scaling-agent-1
+câu 2: HTTP 200 served_by=instance-29ba98 turn=3
+câu 3: HTTP 200 served_by=instance-3331be turn=4
+câu 4: HTTP 200 served_by=instance-29ba98 turn=5
+history count = 8
+  [user] Câu 1 trước khi tắt
+  [assistant] Agent đang hoạt động tốt! (mock response) Hỏi thêm
+  [user] Câu 2 sau khi tắt
+  ...
+  [user] Câu 4 sau khi tắt
+```
+
+Một instance chết, 2 instance còn lại tiếp tục phục vụ, history không mất câu nào. (Trường `turn` lệch 1 so với số câu thật vì code đếm câu hỏi của user sau khi đã thêm câu hiện tại vào history rồi còn cộng thêm 1.) Xong thì `docker compose -p k5-day14-scaling down -v`.
 
 ## Part 6: Output `check_production_ready.py`
 
@@ -297,3 +412,4 @@ def check_budget(user_id: str, estimated_cost: float) -> bool:
 | 2 | Part 1 | Claude chạy bản develop/production, liệt kê anti-pattern kèm dòng code | Bảng 1.1, 1.3 và output curl | Đối chiếu từng dòng với `develop/app.py`; tự xem log server để xác nhận key bị in ra và log JSON của bản production không hiện |
 | 3 | Part 2 | Claude build 2 image, đo size, chạy stack compose, trả lời 2.1/2.3 và vẽ sơ đồ | Số MB từ `docker image inspect`, output curl qua Nginx, sơ đồ | Tự tính lại % chênh từ số byte; đối chiếu sơ đồ với `docker-compose.yml` và `nginx.conf` |
 | 4 | Part 4 | Claude chạy bản develop (API key) và production (JWT), vòng lặp 20 request, giải thích rate limiter và cost guard | Output `curl -i` 401/403/200/429 với token đã che, giải thích thuật toán, cách làm cost guard bằng Redis | Kiểm tra token không còn trong output (đếm = 0); đối chiếu số request trước 429 với limit 10; tự phát hiện lỗi `budget_remaining_usd` trả số đã tiêu |
+| 5 | Part 5 | Claude chạy health/ready, thử SIGTERM khi có 3 request, chạy stack 3 instance, `test_stateless.py` và thử tắt 1 instance | Output, giải thích request bị cắt do `time.sleep` chặn event loop | Đọc `mock_llm.py` (delay 3s) và log uvicorn để xác nhận nguyên nhân; chạy lại sau khi chờ đủ 3 agent healthy; sửa lại nhận định ở Part 1 về handler SIGTERM sau khi thấy thứ tự log |
