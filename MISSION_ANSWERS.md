@@ -522,6 +522,67 @@ Ghi chú về exit code: chạy **một** process (`uvicorn app.main:app`, khôn
 
 Khi Redis đã tắt, `/ready` mất ~4s mới trả 503 (tra DNS tên `redis` của container đã dừng cộng timeout kết nối), vẫn trong 15s script cho phép.
 
+## Part 7: Benchmark & Observability
+
+Số liệu load test, eval và quality gate (Exercise 7.2, 7.3) nằm trong [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md) mục 1–3, file gốc ở `reports/`. Mục này trả lời Exercise 7.1.
+
+### Exercise 7.1: Đọc metrics của agent
+
+Gọi `/ask` một lần ("Prometheus thu thập metrics như thế nào?") trên agent v2 rồi đọc `/metrics` (trích, bỏ các dòng `#`):
+
+```text
+http_requests_total{method="POST",route="/ask",status="200"} 1.0
+agent_in_flight_requests 0.0
+http_request_duration_seconds_bucket{le="0.1",method="POST",route="/ask"} 0.0
+http_request_duration_seconds_bucket{le="0.2",method="POST",route="/ask"} 1.0
+http_request_duration_seconds_count{method="POST",route="/ask"} 1.0
+http_request_duration_seconds_sum{method="POST",route="/ask"} 0.16763223899943114
+llm_tokens_total{model="mock-llm-small",type="input"} 91.0
+llm_tokens_total{model="mock-llm-small",type="output"} 55.0
+llm_cost_usd_total{model="mock-llm-small"} 4.6649999999999996e-05
+agent_info{model="mock-llm-small",version="v2"} 1.0
+```
+
+**1. Mỗi loại metric một ví dụ**
+
+| Loại | Ví dụ | Đặc điểm |
+|---|---|---|
+| Counter | `http_requests_total{method="POST",route="/ask",status="200"} 1.0` (cũng như `llm_tokens_total`, `llm_cost_usd_total`) | Chỉ tăng (reset về 0 khi process khởi động lại). Muốn xem tốc độ thì dùng `rate(...[1m])`. |
+| Gauge | `agent_in_flight_requests 0.0` (và `agent_info`, luôn = 1, mang thông tin version/model trong label) | Lên xuống tự do. Middleware `inc()` khi request vào, `dec()` khi xong. |
+| Histogram | `http_request_duration_seconds` gồm `_bucket{le=...}`, `_count`, `_sum` | Đếm số lần đo rơi vào từng bucket (cộng dồn). Request 168 ms nằm trong bucket `le="0.2"` nhưng không nằm trong `le="0.1"`. Từ bucket tính được p95 bằng `histogram_quantile(0.95, rate(..._bucket[5m]))`, từ `_sum/_count` tính được trung bình. |
+
+**2. Dùng `request.url.path` làm label `route` khi bot quét URL lạ**
+
+Mỗi giá trị label khác nhau tạo một time series mới, và với histogram là một bộ 14 series (12 bucket + `_count` + `_sum`) cho mỗi tổ hợp label.
+
+- Nếu dùng URL thật, mỗi đường dẫn bot thử (`/wp-admin`, `/.env`, `/a1b2c3`, …) sinh thêm 1 series của `http_requests_total` và 14 series của `http_request_duration_seconds`, mãi mãi trong bộ nhớ của process.
+- Bot quét hàng nghìn URL ngẫu nhiên thì sinh ra hàng chục nghìn series. Kết quả: RAM của agent và của Prometheus tăng không giới hạn, `/metrics` phình to và scrape chậm. Đây là "cardinality explosion", và kẻ tấn công điều khiển được nó chỉ bằng request 404.
+- Dùng route template thì mọi URL không khớp gom về một giá trị. Đã thử gọi 3 URL lạ:
+
+```text
+/wp-admin 404
+/.env 404
+/a1b2c3 404
+http_requests_total{method="GET",route="unmatched",status="404"} 3.0
+```
+
+  Ba URL chỉ làm tăng một series. Route có tham số (vd `/users/{id}`) cũng giữ một giá trị template thay vì mỗi id một series.
+
+**Nhiệm vụ: metric `agent_question_length_chars`**
+
+- Đã thêm vào `06-lab-complete/benchmark-observability/develop/app.py`: một Histogram với bucket `(20, 50, 100, 200, 500, 1000, 2000)`. Bucket cuối bằng `max_length` của `AskRequest`. Gọi `QUESTION_LENGTH.observe(len(body.question))` ở đầu `ask()`.
+- Dùng Histogram, không dùng label `length=...`, vì độ dài có tới 2000 giá trị, làm label sẽ gây đúng lỗi cardinality ở câu 2.
+- Kiểm bằng 3 câu dài 13, 40, 86 ký tự:
+
+```text
+agent_question_length_chars_bucket{le="20.0"} 1.0
+agent_question_length_chars_bucket{le="50.0"} 2.0
+agent_question_length_chars_bucket{le="100.0"} 3.0
+agent_question_length_chars_bucket{le="+Inf"} 3.0
+agent_question_length_chars_count 3.0
+agent_question_length_chars_sum 139.0
+```
+
 ## AI log
 
 | # | Phần | Hỏi AI gì | Nhận được gì | Tôi tự sửa / tự kiểm tra thế nào |
@@ -533,3 +594,4 @@ Khi Redis đã tắt, `/ready` mất ~4s mới trả 503 (tra DNS tên `redis` c
 | 5 | Part 5 | Claude chạy health/ready, thử SIGTERM khi có 3 request, chạy stack 3 instance, `test_stateless.py` và thử tắt 1 instance | Output, giải thích request bị cắt do `time.sleep` chặn event loop | Đọc `mock_llm.py` (delay 3s) và log uvicorn để xác nhận nguyên nhân; chạy lại sau khi chờ đủ 3 agent healthy; sửa lại nhận định ở Part 1 về handler SIGTERM sau khi thấy thứ tự log |
 | 6 | Part 6 | Claude viết toàn bộ TODO trong `06-lab-complete/` (config, auth, redis_client, rate_limiter, cost_guard, main, Dockerfile, compose, .dockerignore, .env.example, railway.toml, render.yaml) theo hợp đồng của script chấm | Code + docstring giải thích từng quyết định; script chấm PASS 12/12 | Chạy script bản đầy đủ trong WSL (2 lần, trước và sau khi sửa lỗi field `"13"`); tự thử thêm bằng compose các ca lỗi 401/422/405/429/503; đọc từng file trong `app/` để giải thích được khi vấn đáp |
 | 7 | Part 3 | Claude đưa lệnh Railway CLI, viết so sánh `railway.toml`/`render.yaml`, mô tả pipeline Cloud Run, viết `DEPLOYMENT.md` | Lệnh deploy, bảng so sánh, đoạn 3.3 | Tự đăng nhập Railway, tạo project, đặt biến (key qua stdin) và deploy; tự chạy 4 lệnh CP6 và chụp ảnh; đối chiếu đoạn 3.3 với `cloudbuild.yaml`, `service.yaml` |
+| 8 | Part 7 (develop) | Claude chạy agent v1/v2, load test 4 mức concurrency và 3 mức `MOCK_SLOW_RATE`, eval v1/v2; viết 2 entry `KNOWLEDGE_BASE` theo `missing_keywords`, thêm metric `agent_question_length_chars`, viết job CI `.github/workflows/eval.yml`, điền `BENCHMARK_REPORT.md` mục 1–3 | Các file `reports/*.json`, câu trả lời 7.1, nhận xét bảng 2.1/2.2/3 | Không chép KB của lời giải mẫu: tự viết nội dung, kiểm golden dataset trước để chắc keyword mới không đổi câu khác (eval cuối: 23/23, 0 regression). Thấy c=100 RPS tụt thì không đoán mà chạy thêm thí nghiệm (đo latency trong agent, `ListenOverflows`, chia 2 tiến trình client). Đối chiếu từng số trong báo cáo với JSON, sửa 2 chỗ (tỉ lệ 16/299 = 5.35%, ghi thêm lượt chạy lại có error rate 2.33%) |
